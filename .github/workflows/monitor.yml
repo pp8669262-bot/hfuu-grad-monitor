@@ -1,0 +1,65 @@
+name: 合大通知监测
+
+on:
+  schedule:
+    # GitHub Actions 的 cron 使用 UTC
+    # 00:00 UTC = 北京时间 08:00 ; 12:00 UTC = 北京时间 20:00
+    - cron: '0 0 * * *'
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      init:
+        description: '填 true 表示重建基线（本次不推送）'
+        required: false
+        default: 'false'
+      pages:
+        description: '每个栏目抓取页数'
+        required: false
+        default: '2'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: hfuu-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 抓取并整理通知
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          PAGES="${{ github.event.inputs.pages || '2' }}"
+          if [ "${{ github.event.inputs.init }}" = "true" ]; then
+            python monitor.py --init --pages "$PAGES"
+          else
+            python monitor.py --pages "$PAGES"
+          fi
+
+      - name: 归档日报与去重状态
+        run: |
+          git config user.name "hfuu-monitor[bot]"
+          git config user.email "hfuu-monitor[bot]@users.noreply.github.com"
+          git add state/ reports/
+          if git diff --staged --quiet; then
+            echo "本次无文件变更"
+          else
+            git commit -m "chore: update monitor state $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
