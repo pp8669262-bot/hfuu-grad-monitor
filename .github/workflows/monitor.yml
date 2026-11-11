@@ -1,11 +1,9 @@
 name: 合大通知监测
 
 on:
-  schedule:
-    # GitHub Actions 的 cron 使用 UTC
-    # 00:00 UTC = 北京时间 08:00 ; 12:00 UTC = 北京时间 20:00
-    - cron: '0 0 * * *'
-    - cron: '0 12 * * *'
+  # 近实时监测由本机常驻进程负责（默认每 180 秒一轮）。
+  # GitHub Actions 最快只能 5 分钟一跑且常排队延迟，这里不再设固定定时，
+  # 避免与本机重复提醒；保留手动触发作为云端备份。
   workflow_dispatch:
     inputs:
       init:
@@ -44,6 +42,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          HFUU_MAIL_USER: ${{ secrets.MAIL_USER }}
+          HFUU_MAIL_PASS: ${{ secrets.MAIL_PASS }}
+          HFUU_MAIL_TO: ${{ secrets.MAIL_TO }}
         run: |
           PAGES="${{ github.event.inputs.pages || '2' }}"
           if [ "${{ github.event.inputs.init }}" = "true" ]; then
