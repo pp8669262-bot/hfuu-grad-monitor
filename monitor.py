@@ -3,33 +3,58 @@
 """
 合肥大学通知监测器
 ==================
-定期抓取合肥大学官网各栏目，筛出「研究生事务 / 奖学金与资助 / 竞赛与创新创业」
-相关通知，去重后生成 Markdown 日报；有新通知时自动创建一条 GitHub Issue，
-由 GitHub 给仓库主人发送邮件提醒。
+抓取合肥大学官网各栏目，筛出「研究生事务 / 奖学金与资助 / 竞赛与创新创业」
+相关通知，去重后生成 Markdown 日报；有新通知时发邮件、写桌面日报，
+并可选创建 GitHub Issue（云端模式）。
 
-用法：
-    python monitor.py --dry-run          # 本地试跑，只打印，不写文件/不推送
-    python monitor.py --init             # 重建基线（不推送）
-    python monitor.py                    # 正常运行（GitHub Actions 里就是这个）
+两种运行方式
+------------
+1) 本机常驻（近实时，推荐）：
+       pythonw monitor.py --loop --local
+   默认每 180 秒扫一轮，开机自启由 Windows 计划任务负责。
+   邮件用本机 config.json 里的 163 SMTP 授权码直发，凭证不上传云端。
 
-环境变量：
-    GITHUB_TOKEN        Actions 自动注入，用于创建 Issue
-    GITHUB_REPOSITORY   Actions 自动注入，形如 owner/repo
-    HFUU_PAGES          每个栏目抓几页，默认 2
-    HFUU_NO_SUMMARY     设为 1 可关闭正文摘要抓取
-    HFUU_TRUST_ENV      设为 1 时允许使用系统代理环境变量（默认关闭）
+2) 单次运行（GitHub Actions / 手动）：
+       python monitor.py                 # 正常一轮，推送 Issue + 邮件
+       python monitor.py --dry-run       # 只打印，不写状态、不推送
+       python monitor.py --init          # 重建基线（不推送）
+
+命令行参数
+----------
+    --loop                常驻循环运行
+    --interval N          轮询间隔秒数，默认读 config.json 的 interval_seconds（180）
+    --local               本地模式：跳过 GitHub Issue，只发邮件 + 写桌面日报
+    --no-mail             本轮不发邮件
+    --pages N             每个栏目抓几页，默认 2
+    --no-summary          不抓取正文摘要
+    --dry-run / --init    见上
+
+环境变量
+--------
+    GITHUB_TOKEN / GITHUB_REPOSITORY   Actions 自动注入，用于建 Issue
+    HFUU_PAGES                        默认抓取页数
+    HFUU_NO_SUMMARY                   设为 1 关闭摘要
+    HFUU_TRUST_ENV                    设为 1 时允许使用系统代理环境变量
+    HFUU_LOCAL_OUT                    桌面日报输出目录（默认 D:\\桌面\\合肥大学通知速递）
+    HFUU_MAIL_USER / HFUU_MAIL_PASS / HFUU_MAIL_TO
+                                      云端 Secrets 注入的 SMTP 配置（覆盖 config.json）
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
+import smtplib
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from email.header import Header
+from email.mime.text import MIMEText
+from email.utils import formataddr
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -115,10 +140,78 @@ BODY_SELECTORS = [
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "state" / "seen.json"
 REPORT_DIR = ROOT / "reports"
+CONFIG_FILE = ROOT / "config.json"
+LOG_FILE = ROOT / "daemon.log"
+LOCAL_OUT = Path(os.environ.get("HFUU_LOCAL_OUT", r"D:\桌面\合肥大学通知速递"))
+
+DEFAULT_CONFIG = {
+    "interval_seconds": 180,
+    "mail": {
+        "enabled": True,
+        "smtp_host": "smtp.163.com",
+        "smtp_port": 465,
+        "ssl": True,
+        "user": "qwe5200202@163.com",
+        "auth_code": "",
+        "to": ["qwe5200202@163.com"],
+        "from_name": "合大通知速递",
+    },
+}
+
+MAIL_CSS = (
+    "body{font-family:'Microsoft YaHei',Arial,sans-serif;line-height:1.7;"
+    "color:#24292f;max-width:760px;margin:0 auto;padding:18px}"
+    "h1{font-size:22px;border-bottom:3px solid #0969da;padding-bottom:10px}"
+    "h2{font-size:18px;color:#0969da;margin-top:28px}"
+    "h3{font-size:16px;margin:18px 0 6px}"
+    "h3 a{color:#0969da;text-decoration:none}"
+    "li,p,blockquote{font-size:14px}"
+    "blockquote{background:#f6f8fa;border-left:4px solid #d0d7de;"
+    "margin:12px 0;padding:8px 14px;color:#57606a}"
+    "hr{border:0;border-top:1px solid #d8dee4;margin:22px 0}"
+    "a{color:#0969da}"
+)
 
 
 def log(msg: str) -> None:
-    print(f"[monitor] {msg}", flush=True)
+    line = f"[{datetime.now(CN_TZ):%Y-%m-%d %H:%M:%S}] {msg}"
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 1_500_000:
+            LOG_FILE.write_text("", encoding="utf-8")  # 简单轮转，避免日志无限增长
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    try:
+        print(f"[monitor] {msg}", flush=True)
+    except Exception:
+        pass  # pythonw 无控制台时 stdout 可能不可用
+
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if not CONFIG_FILE.exists():
+        try:
+            CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+            log("已生成配置模板 config.json，填入 mail.auth_code 后即可发邮件")
+        except Exception as exc:
+            log(f"配置模板写入失败: {type(exc).__name__}: {exc}")
+    else:
+        try:
+            d = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            cfg.update({k: v for k, v in d.items() if k != "mail"})
+            cfg["mail"].update(d.get("mail", {}))
+        except Exception as exc:
+            log(f"配置读取失败，使用默认值: {type(exc).__name__}: {exc}")
+    # 云端 Secrets 覆盖本地配置
+    if os.environ.get("HFUU_MAIL_USER"):
+        cfg["mail"]["user"] = os.environ["HFUU_MAIL_USER"]
+    if os.environ.get("HFUU_MAIL_PASS"):
+        cfg["mail"]["auth_code"] = os.environ["HFUU_MAIL_PASS"]
+    if os.environ.get("HFUU_MAIL_TO"):
+        cfg["mail"]["to"] = [x.strip() for x in os.environ["HFUU_MAIL_TO"].split(",") if x.strip()]
+    return cfg
 
 
 def make_session() -> requests.Session:
@@ -171,9 +264,9 @@ def is_relevant(title: str, mode: str) -> bool:
     return any(h in title for h in NOTICE_HINTS)  # 必须是公文，不是新闻稿
 
 
-def parse_list(html: str, base_url: str, source: str, mode: str,
+def parse_list(html_text: str, base_url: str, source: str, mode: str,
                default_topic: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html_text, "html.parser")
     out: list[dict] = []
     seen_href: set[str] = set()
     for a in soup.find_all("a", href=True):
@@ -213,10 +306,10 @@ def parse_list(html: str, base_url: str, source: str, mode: str,
 
 
 def fetch_summary(session: requests.Session, url: str) -> str:
-    html = fetch(session, url, retries=1)
-    if not html:
+    html_text = fetch(session, url, retries=1)
+    if not html_text:
         return ""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html_text, "html.parser")
     text = ""
     for sel in BODY_SELECTORS:
         node = soup.select_one(sel)
@@ -238,13 +331,14 @@ def crawl(session: requests.Session, pages: int) -> list[dict]:
     for name, url, mode, default_topic in SOURCES:
         found: list[dict] = []
         for purl in page_urls(url, pages):
-            html = fetch(session, purl)
-            if html:
-                found.extend(parse_list(html, purl, name, mode, default_topic))
+            html_text = fetch(session, purl)
+            if html_text:
+                found.extend(parse_list(html_text, purl, name, mode, default_topic))
         # 同栏目跨页去重
         uniq = {it["id"]: it for it in found}
         all_items.extend(uniq.values())
-        log(f"{name}: {len(uniq)} 条")
+        if uniq:
+            log(f"{name}: {len(uniq)} 条")
     # 全局按 URL 去重，保留第一次出现的栏目
     merged: dict[str, dict] = {}
     for it in all_items:
@@ -325,11 +419,84 @@ def build_report(new_items: list[dict], baseline: bool, total: int, now: datetim
             lines.append("")
     lines += [
         "---", "",
-        "有小标题看不全？点标题即可跳转官网原文。"
-        "如需增减栏目或关键词，编辑仓库 `monitor.py` 顶部的 `SOURCES` / `TOPICS`。",
+        "点标题即可跳转官网原文。如需增减栏目或关键词，编辑 `monitor.py` 顶部的 `SOURCES` / `TOPICS`。",
         "",
     ]
     return "\n".join(lines)
+
+
+def linkify(text: str) -> str:
+    safe = html.escape(text, quote=False)
+    return re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)",
+                  r'<a href="\2">\1</a>', safe)
+
+
+def md_to_html(md: str) -> str:
+    parts: list[str] = []
+    for raw in md.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if s.startswith("### "):
+            parts.append(f"<h3>{linkify(s[4:])}</h3>")
+        elif s.startswith("## "):
+            parts.append(f"<h2>{linkify(s[3:])}</h2>")
+        elif s.startswith("# "):
+            parts.append(f"<h1>{linkify(s[2:])}</h1>")
+        elif s.startswith("> "):
+            parts.append(f"<blockquote>{linkify(s[2:])}</blockquote>")
+        elif s.startswith("- "):
+            parts.append(f"<li>{linkify(s[2:])}</li>")
+        elif s == "---":
+            parts.append("<hr>")
+        else:
+            parts.append(f"<p>{linkify(s)}</p>")
+    return (f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<style>{MAIL_CSS}</style></head><body>" + "\n".join(parts)
+            + "</body></html>")
+
+
+def send_mail(cfg: dict, subject: str, report_md: str) -> bool:
+    m = cfg["mail"]
+    if not m.get("enabled", True):
+        log("邮件推送已在配置中关闭")
+        return False
+    if not m.get("auth_code"):
+        log("未发送邮件：config.json 里 mail.auth_code 还是空的（需填 163 SMTP 授权码）")
+        return False
+    try:
+        msg = MIMEText(md_to_html(report_md), "html", "utf-8")
+        msg["From"] = formataddr((str(Header(m.get("from_name", "合大通知速递"), "utf-8")),
+                                  m["user"]))
+        msg["To"] = ", ".join(m["to"])
+        msg["Subject"] = Header(subject, "utf-8")
+        host, port = m["smtp_host"], int(m["smtp_port"])
+        if m.get("ssl", True):
+            server = smtplib.SMTP_SSL(host, port, timeout=25)
+        else:
+            server = smtplib.SMTP(host, port, timeout=25)
+            server.starttls()
+        server.login(m["user"], m["auth_code"])
+        server.sendmail(m["user"], m["to"], msg.as_string())
+        server.quit()
+        log(f"邮件已发送至 {', '.join(m['to'])}｜主题：{subject}")
+        return True
+    except Exception as exc:
+        log(f"邮件发送失败: {type(exc).__name__}: {exc}")
+        return False
+
+
+def write_local_report(report: str, now: datetime, new_count: int) -> None:
+    try:
+        LOCAL_OUT.mkdir(parents=True, exist_ok=True)
+        (LOCAL_OUT / "日报").mkdir(exist_ok=True)
+        (LOCAL_OUT / "最新速递.md").write_text(report, encoding="utf-8")
+        (LOCAL_OUT / "日报" / f"{now:%Y-%m-%d_%H%M}.md").write_text(report, encoding="utf-8")
+        if new_count:
+            (LOCAL_OUT / "最新提醒.md").write_text(report, encoding="utf-8")
+        log(f"桌面日报已写入 {LOCAL_OUT}")
+    except Exception as exc:
+        log(f"桌面日报写入失败: {type(exc).__name__}: {exc}")
 
 
 def create_issue(title: str, body: str) -> bool:
@@ -362,19 +529,9 @@ def create_issue(title: str, body: str) -> bool:
     return False
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="合肥大学研究生/奖学金/竞赛通知监测器")
-    ap.add_argument("--dry-run", action="store_true", help="只打印，不写状态文件、不推送")
-    ap.add_argument("--init", action="store_true", help="强制重建基线，不推送")
-    ap.add_argument("--pages", type=int, default=int(os.environ.get("HFUU_PAGES", "2")),
-                    help="每个栏目抓取页数，默认 2")
-    ap.add_argument("--no-summary", action="store_true", help="不抓取正文摘要")
-    args = ap.parse_args()
-
+def run_once(args, cfg: dict, state: dict) -> dict:
     now = datetime.now(CN_TZ)
     session = make_session()
-
-    state = load_state()
     baseline = args.init or not state["items"]
 
     log(f"开始扫描（{now:%Y-%m-%d %H:%M} 北京时间），每栏目 {args.pages} 页")
@@ -394,28 +551,33 @@ def main() -> int:
     report = build_report(new_items, baseline, len(items), now)
 
     if args.dry_run:
-        print("\n" + "=" * 60)
-        print(report[:6000])
-        print("=" * 60)
-        if new_items and not baseline:
-            print("\n[dry-run] 以下为本次会推送的新增条目：")
-            for it in new_items:
-                print(f"  [{it['topic']}] {it['date']} {it['title']}")
-        return 0
+        try:
+            print("\n" + "=" * 60)
+            print(report[:6000])
+            print("=" * 60)
+        except Exception:
+            pass
+        return state
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     fname = f"{now:%Y-%m-%d}-{now:%H%M}.md"
     (REPORT_DIR / fname).write_text(report, encoding="utf-8")
     (REPORT_DIR / "latest.md").write_text(report, encoding="utf-8")
-    log(f"日报已写入 reports/{fname}")
+
+    # 本机常驻模式：桌面日报 + 邮件；非本地模式额外发 GitHub Issue
+    if args.local:
+        write_local_report(report, now, 0 if baseline else len(new_items))
 
     if not baseline and new_items:
-        counts = {}
+        counts: dict[str, int] = {}
         for it in new_items:
             counts[it["topic"]] = counts.get(it["topic"], 0) + 1
         detail = " / ".join(f"{k} {v}" for k, v in counts.items())
-        title = f"[合大通知速递] {now:%m-%d %H:%M} 新增 {len(new_items)} 条（{detail}）"
-        create_issue(title, report + f"\n\n> 由 GitHub Actions 自动生成 · {fname}\n")
+        subject = f"[合大通知速递] {now:%m-%d %H:%M} 新增 {len(new_items)} 条（{detail}）"
+        if not args.no_mail:
+            send_mail(cfg, subject, report)
+        if not args.local:
+            create_issue(subject, report + f"\n\n> 自动生成 · {fname}\n")
     elif baseline:
         log("基线已建立，本次不推送（下次运行起只提醒新增通知）")
 
@@ -426,8 +588,41 @@ def main() -> int:
             "source": it["source"], "first_seen": stamp,
         })
     save_state(state)
-    log("状态已保存")
-    return 0
+    log("本轮完成，状态已保存")
+    return state
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="合肥大学研究生/奖学金/竞赛通知监测器")
+    ap.add_argument("--loop", action="store_true", help="常驻循环，按间隔持续监测")
+    ap.add_argument("--interval", type=int, default=0, help="轮询间隔秒数，默认 180")
+    ap.add_argument("--local", action="store_true", help="本机模式：写桌面日报、跳过 GitHub Issue")
+    ap.add_argument("--no-mail", action="store_true", help="本轮不发邮件")
+    ap.add_argument("--dry-run", action="store_true", help="只打印，不写状态文件、不推送")
+    ap.add_argument("--init", action="store_true", help="强制重建基线，不推送")
+    ap.add_argument("--pages", type=int, default=int(os.environ.get("HFUU_PAGES", "2")),
+                    help="每个栏目抓取页数，默认 2")
+    ap.add_argument("--no-summary", action="store_true", help="不抓取正文摘要")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    state = load_state()
+
+    if not args.loop:
+        run_once(args, cfg, state)
+        return 0
+
+    interval = args.interval or int(cfg.get("interval_seconds", 180))
+    if interval < 60:
+        interval = 60  # 保护官网，避免过于频繁请求
+    log(f"常驻监测启动：每 {interval} 秒一轮 | 收件 {', '.join(cfg['mail']['to'])} "
+        f"| 输出 {LOCAL_OUT}")
+    while True:
+        try:
+            state = run_once(args, cfg, state)
+        except Exception as exc:
+            log(f"本轮异常，{interval} 秒后重试: {type(exc).__name__}: {exc}")
+        time.sleep(interval)
 
 
 if __name__ == "__main__":
